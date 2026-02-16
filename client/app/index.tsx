@@ -6,117 +6,214 @@ import {
   ScrollView,
   TouchableOpacity,
   Platform,
+  Image,
 } from "react-native";
 import { BleManager, Device, State } from "react-native-ble-plx";
 import { Buffer } from "buffer";
 import { PermissionsAndroid } from "react-native";
 
-// ===== UUIDs =====
 const SERVICE_UUID = "0000ffe5-0000-1000-8000-00805f9a34fb";
-const READ_UUID    = "0000ffe4-0000-1000-8000-00805f9a34fb";
-const WRITE_UUID   = "0000ffe9-0000-1000-8000-00805f9a34fb";
+const READ_UUID = "0000ffe4-0000-1000-8000-00805f9a34fb";
+const WRITE_UUID = "0000ffe9-0000-1000-8000-00805f9a34fb";
 
 const bleManager = new BleManager();
 const int16 = (n: number) => (n >= 0x8000 ? n - 0x10000 : n);
 
-// ===== Permissions =====
+/* ================= FIR ================= */
+class FIRBandpass {
+  fastAlpha = 0.2;
+  slowAlpha = 0.02;
+  fast = 0;
+  slow = 0;
+
+  filter(x: number) {
+    this.fast += this.fastAlpha * (x - this.fast);
+    this.slow += this.slowAlpha * (x - this.slow);
+    return this.fast - this.slow;
+  }
+
+  reset() {
+    this.fast = 0;
+    this.slow = 0;
+  }
+}
+
+/* ================= FATIGUE ================= */
+class WristFatigueDetector {
+  win = 200;
+  alpha = 0.02;
+  beta = 0.02;
+  k = 0.3;
+  thresholdFactor = 7;
+  deadband = 0.5;
+
+  biasX = 0;
+  biasY = 0;
+  biasZ = 0;
+  calibrating = true;
+  calibrationSamples = 0;
+  calibrationLimit = 600;
+
+  buffer: number[] = [];
+  meanEst = 0;
+  varEst = 1;
+  cusumPos = 0;
+  detected = false;
+
+  filter = new FIRBandpass();
+
+  applyDeadband(v: number) {
+    return Math.abs(v) < this.deadband ? 0 : v;
+  }
+
+  magnitude(gx: number, gy: number, gz: number) {
+    return Math.sqrt(gx * gx + gy * gy + gz * gz);
+  }
+
+  rms(arr: number[]) {
+    const sum = arr.reduce((a, b) => a + b * b, 0);
+    return Math.sqrt(sum / arr.length);
+  }
+
+  update(gx: number, gy: number, gz: number) {
+    if (this.calibrating) {
+      this.biasX += gx;
+      this.biasY += gy;
+      this.biasZ += gz;
+      this.calibrationSamples++;
+
+      if (this.calibrationSamples >= this.calibrationLimit) {
+        this.biasX /= this.calibrationLimit;
+        this.biasY /= this.calibrationLimit;
+        this.biasZ /= this.calibrationLimit;
+        this.calibrating = false;
+      }
+      return { calibrating: true };
+    }
+
+    gx -= this.biasX;
+    gy -= this.biasY;
+    gz -= this.biasZ;
+
+    gx = this.applyDeadband(gx);
+    gy = this.applyDeadband(gy);
+    gz = this.applyDeadband(gz);
+
+    const mag = this.magnitude(gx, gy, gz);
+    const tremor = this.filter.filter(mag);
+
+    this.buffer.push(tremor);
+    if (this.buffer.length < this.win) return null;
+
+    const segment = this.buffer.splice(0, this.win);
+    const currentRMS = this.rms(segment);
+
+    this.meanEst =
+      (1 - this.alpha) * this.meanEst + this.alpha * currentRMS;
+
+    this.varEst =
+      (1 - this.beta) * this.varEst +
+      this.beta * Math.pow(currentRMS - this.meanEst, 2);
+
+    const stdEst = Math.sqrt(this.varEst);
+    if (stdEst < 1e-6) return null;
+
+    const z = (currentRMS - this.meanEst) / stdEst;
+    const s = z - this.k;
+
+    this.cusumPos = Math.max(0, this.cusumPos + s);
+
+    const fatiguePercent = Math.min(
+      100,
+      (this.cusumPos / this.thresholdFactor) * 100
+    );
+
+    if (this.cusumPos > this.thresholdFactor)
+      this.detected = true;
+
+    return {
+      rms: currentRMS,
+      fatiguePercent,
+      detected: this.detected,
+      st: this.cusumPos,
+      zt: z,
+      calibrating: false,
+    };
+  }
+}
+
+/* ================= PERMISSIONS ================= */
 async function requestPerms() {
   if (Platform.OS !== "android") return true;
-  const g = await PermissionsAndroid.requestMultiple([
+  const granted = await PermissionsAndroid.requestMultiple([
     PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
     PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
     PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
   ]);
-  return g["android.permission.BLUETOOTH_SCAN"] === "granted";
+  return granted["android.permission.BLUETOOTH_SCAN"] === "granted";
 }
 
+/* ================= COMPONENT ================= */
 export default function Index() {
-  const [status, setStatus] = useState("Initializing Bluetooth...");
+  const [status, setStatus] = useState("Initializing...");
   const [devices, setDevices] = useState<Record<string, Device>>({});
-  const [connected, setConnected] = useState<Device | null>(null);
   const [dropdownOpen, setDropdownOpen] = useState(false);
-  const [data, setData] = useState<any>({});
+  const [connected, setConnected] = useState<Device | null>(null);
+  const [gyroData, setGyroData] = useState<any>({});
+  const [fatigue, setFatigue] = useState({
+    rms: 0,
+    percent: 0,
+    detected: false,
+    st: 0,
+    zt: 0,
+  });
+  const [calibrating, setCalibrating] = useState(true);
 
+  const detector = useRef(new WristFatigueDetector());
   const tempBytes = useRef<number[]>([]);
-  const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // ===== INIT =====
   useEffect(() => {
-    let sub: any;
-
     (async () => {
       await requestPerms();
-      if (Platform.OS === "android") {
-        try { await bleManager.enable(); } catch {}
-      }
-
-      const s = await bleManager.state();
-      if (s === State.PoweredOn) scan();
-
-      sub = bleManager.onStateChange((st) => {
-        if (st === State.PoweredOn) scan();
-      }, true);
+      const state = await bleManager.state();
+      if (state === State.PoweredOn) scan();
     })();
-
-    return () => {
-      if (sub) sub.remove();
-      if (pollTimer.current) clearInterval(pollTimer.current);
-      bleManager.destroy();
-    };
   }, []);
 
-  // ===== SCAN =====
+  /* ===== SCAN ===== */
   const scan = () => {
-    setStatus("Scanning for devices...");
     setDevices({});
-    bleManager.startDeviceScan(null, null, (_, d) => {
-      if (!d) return;
-      setDevices((prev) => ({ ...prev, [d.id]: d }));
-    });
-  };
+    setStatus("Scanning...");
 
-  // ===== CONNECT =====
-  const connect = async (d: Device) => {
-    bleManager.stopDeviceScan();
-    setDropdownOpen(false);
-    setStatus("Connecting...");
+    bleManager.startDeviceScan(
+      null,
+      { allowDuplicates: false },
+      (error, device) => {
+        if (error) {
+          console.log(error);
+          return;
+        }
+        if (!device) return;
 
-    const dev = await d.connect();
-    await dev.discoverAllServicesAndCharacteristics();
-
-    dev.onDisconnected(() => {
-      setConnected(null);
-      setStatus("Disconnected");
-      if (pollTimer.current) clearInterval(pollTimer.current);
-    });
-
-    setConnected(dev);
-    setStatus("Connected");
-
-    startNotify(dev);
-    startPolling(dev);
-  };
-
-  // ===== WRITE =====
-  const writeCmd = async (dev: Device, bytes: number[]) => {
-    await dev.writeCharacteristicWithResponseForService(
-      SERVICE_UUID,
-      WRITE_UUID,
-      Buffer.from(bytes).toString("base64")
+        setDevices((prev) => ({
+          ...prev,
+          [device.id]: device,
+        }));
+      }
     );
   };
 
-  // ===== SAME AS sendDataTh =====
-  const startPolling = async (dev: Device) => {
-    await new Promise((r) => setTimeout(r, 3000));
-    pollTimer.current = setInterval(async () => {
-      await writeCmd(dev, [0xff, 0xaa, 0x27, 0x3a, 0x00]);
-      await writeCmd(dev, [0xff, 0xaa, 0x27, 0x51, 0x00]);
-    }, 200);
-  };
+  /* ===== CONNECT ===== */
+  const connect = async (device: Device) => {
+    bleManager.stopDeviceScan();
+    setStatus("Connecting...");
 
-  // ===== NOTIFY =====
-  const startNotify = (dev: Device) => {
+    const dev = await device.connect();
+    await dev.discoverAllServicesAndCharacteristics();
+    setConnected(dev);
+    setStatus("Connected");
+    setDropdownOpen(false);
+
     dev.monitorCharacteristicForService(
       SERVICE_UUID,
       READ_UUID,
@@ -127,24 +224,9 @@ export default function Index() {
     );
   };
 
-  // ===== PYTHON onDataReceived =====
   const handleIncoming = (buf: Buffer) => {
     for (const b of buf) {
       tempBytes.current.push(b);
-
-      if (tempBytes.current.length === 1 && tempBytes.current[0] !== 0x55) {
-        tempBytes.current = [];
-        return;
-      }
-
-      if (
-        tempBytes.current.length === 2 &&
-        ![0x61, 0x71].includes(tempBytes.current[1])
-      ) {
-        tempBytes.current = [];
-        return;
-      }
-
       if (tempBytes.current.length === 20) {
         processFrame([...tempBytes.current]);
         tempBytes.current = [];
@@ -152,51 +234,68 @@ export default function Index() {
     }
   };
 
-  // ===== PYTHON processData =====
   const processFrame = (B: number[]) => {
-    if (B[1] === 0x61) {
-      setData((d: any) => ({
-        ...d,
-        AccX: +(int16(B[3] << 8 | B[2]) / 32768 * 16).toFixed(3),
-        AccY: +(int16(B[5] << 8 | B[4]) / 32768 * 16).toFixed(3),
-        AccZ: +(int16(B[7] << 8 | B[6]) / 32768 * 16).toFixed(3),
-        AngX: +(int16(B[15] << 8 | B[14]) / 32768 * 180).toFixed(3),
-        AngY: +(int16(B[17] << 8 | B[16]) / 32768 * 180).toFixed(3),
-        AngZ: +(int16(B[19] << 8 | B[18]) / 32768 * 180).toFixed(3),
-      }));
+    const Gx = (int16((B[9] << 8) | B[8]) / 32768) * 2000;
+    const Gy = (int16((B[11] << 8) | B[10]) / 32768) * 2000;
+    const Gz = (int16((B[13] << 8) | B[12]) / 32768) * 2000;
+
+    const result = detector.current.update(Gx, Gy, Gz);
+
+    if (result?.calibrating) {
+      setCalibrating(true);
+      return;
     }
 
-    if (B[2] === 0x51) {
-      setData((d: any) => ({
-        ...d,
-        Q0: +(int16(B[5] << 8 | B[4]) / 32768).toFixed(5),
-        Q1: +(int16(B[7] << 8 | B[6]) / 32768).toFixed(5),
-        Q2: +(int16(B[9] << 8 | B[8]) / 32768).toFixed(5),
-        Q3: +(int16(B[11] << 8 | B[10]) / 32768).toFixed(5),
-      }));
+    setCalibrating(false);
+
+    if (result && result.fatiguePercent !== undefined) {
+      setFatigue({
+        rms: +result.rms.toFixed(3),
+        percent: +result.fatiguePercent.toFixed(1),
+        detected: result.detected ?? false,
+        st: +result.st.toFixed(3),
+        zt: +result.zt.toFixed(3),
+      });
     }
+
+    setGyroData({
+      Gx: Gx.toFixed(2),
+      Gy: Gy.toFixed(2),
+      Gz: Gz.toFixed(2),
+    });
   };
 
-  // ===== UI =====
   return (
-    <ScrollView style={styles.container}>
-      <Text style={styles.title}>WT Sensor</Text>
-      <Text>Status: {status}</Text>
+    <ScrollView
+      style={styles.container}
+      contentContainerStyle={{ paddingBottom: 120 }}
+    >
+      <View style={{ alignItems: "center" }}>
+        <Image
+          source={require("../assets/images/logo.png")}
+          style={{ height: 100, width: 100 }}
+        />
+      </View>
 
-      {/* Connected device */}
-      <View style={styles.card}>
-        <Text style={styles.header}>Connected Device</Text>
-        <Text>
-          {connected
-            ? `${connected.name ?? "Unnamed"} (${connected.id})`
-            : "None"}
+      <View>
+         <Text style={styles.subheading}>AICRP on ESAAS</Text>
+        <Text style={styles.kgp}>IIT Kharagpur Center</Text>
+      </View>
+
+
+      <View style={styles.headerContainer}>
+        <Text style={styles.mainTitle}>Muscle Fatigue Monitor</Text>
+        <Text style={styles.subTitle}>
+          Wrist Tremor Analysis System
         </Text>
       </View>
 
-      {/* Dropdown */}
+      {/* DROPDOWN */}
       <View style={styles.card}>
-        <TouchableOpacity onPress={() => setDropdownOpen(!dropdownOpen)}>
-          <Text style={styles.header}>
+        <TouchableOpacity
+          onPress={() => setDropdownOpen(!dropdownOpen)}
+        >
+          <Text style={styles.sectionTitle}>
             Available Devices {dropdownOpen ? "▲" : "▼"}
           </Text>
         </TouchableOpacity>
@@ -205,42 +304,154 @@ export default function Index() {
           Object.values(devices).map((d) => (
             <TouchableOpacity
               key={d.id}
-              style={styles.row}
+              style={styles.deviceRow}
               onPress={() => connect(d)}
             >
-              <Text>{d.name ?? "Unnamed"}</Text>
-              <Text style={styles.small}>{d.id}</Text>
+              <Text>{d.name ?? "Unnamed Device"}</Text>
+              <Text style={styles.smallText}>{d.id}</Text>
             </TouchableOpacity>
           ))}
       </View>
 
-      {/* Data */}
-      <View style={styles.card}>
-        <Text style={styles.header}>Live Data</Text>
-        {Object.entries(data).map(([k, v]) => (
-          <Text key={k}>{k}: {String(v)}</Text>
-        ))}
+      {/* STATUS */}
+      <View style={styles.statusCard}>
+        <Text style={styles.statusText}>
+          {connected ? "🟢 Connected" : "🔴 Not Connected"}
+        </Text>
+        <Text style={styles.smallText}>{status}</Text>
       </View>
+
+      {/* GYRO */}
+      {connected && (
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>Gyroscope (deg/s)</Text>
+          {Object.entries(gyroData).map(([k, v]) => (
+            <Text key={k} style={styles.dataText}>
+              {k}: {String(v)}
+            </Text>
+          ))}
+        </View>
+      )}
+
+      {/* FATIGUE */}
+      {connected && (
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>Fatigue Detection</Text>
+
+          {calibrating ? (
+            <Text style={styles.calibrationText}>
+              Calibrating... Keep sensor still
+            </Text>
+          ) : (
+            <>
+              <Text style={styles.dataText}>RMS: {fatigue.rms}</Text>
+              <Text style={styles.dataText}>Z-score: {fatigue.zt}</Text>
+              <Text style={styles.dataText}>CUSUM: {fatigue.st}</Text>
+              <Text style={styles.dataText}>
+                Fatigue %: {fatigue.percent}%
+              </Text>
+
+              <Text
+                style={[
+                  styles.statusResult,
+                  {
+                    color: fatigue.detected ? "red" : "green",
+                  },
+                ]}
+              >
+                {fatigue.detected
+                  ? "⚠️ FATIGUE DETECTED"
+                  : "Normal"}
+              </Text>
+            </>
+          )}
+        </View>
+      )}
     </ScrollView>
   );
 }
 
-// ===== STYLES =====
+/* ================= STYLES ================= */
 const styles = StyleSheet.create({
-  container: { padding: 20 },
-  title: { fontSize: 24, fontWeight: "bold", marginBottom: 6 },
-  card: {
-    backgroundColor: "#f2f2f2",
-    padding: 12,
-    borderRadius: 10,
-    marginTop: 12,
+  container: {
+    flex: 1,
+    backgroundColor: "#f8f9fa",
+    paddingHorizontal: 20,
+    paddingTop: 40,
   },
-  header: { fontSize: 16, fontWeight: "600", marginBottom: 6 },
-  row: {
+  headerContainer: {
+    alignItems: "center",
+    marginBottom: 20,
+  },
+  mainTitle: {
+    fontSize: 24,
+    fontWeight: "bold",
+    textAlign: "center",
+  },
+  subTitle: {
+    fontSize: 14,
+    color: "#666",
+    marginTop: 4,
+  },
+  card: {
+    backgroundColor: "white",
+    padding: 16,
+    borderRadius: 12,
+    marginBottom: 20,
+    elevation: 2,
+  },
+  sectionTitle: {
+    fontSize: 16,
+    fontWeight: "600",
+  },
+  deviceRow: {
+    marginTop: 10,
     padding: 10,
-    backgroundColor: "#e6e6e6",
-    borderRadius: 6,
+    backgroundColor: "#f0f0f0",
+    borderRadius: 8,
+  },
+  statusCard: {
+    backgroundColor: "white",
+    padding: 16,
+    borderRadius: 12,
+    alignItems: "center",
+    marginBottom: 20,
+    elevation: 2,
+  },
+  statusText: {
+    fontSize: 18,
+    fontWeight: "600",
+  },
+  smallText: {
+    fontSize: 12,
+    color: "#666",
+  },
+  dataText: {
+    fontSize: 15,
+    marginTop: 4,
+  },
+  calibrationText: {
+    color: "#ff8800",
     marginTop: 6,
   },
-  small: { fontSize: 11, color: "#666" },
+  statusResult: {
+    marginTop: 10,
+    fontSize: 18,
+    fontWeight: "bold",
+    textAlign: "center",
+  },
+  subheading:{
+    textAlign: "center",
+    fontSize: 18,
+    fontWeight: "600",
+    marginBottom: 5,
+    color:"red"
+  },
+  kgp:{
+    textAlign: "center",
+    fontSize: 18,
+    fontWeight: "900",
+    marginBottom: 15,
+    color:"#240e84"
+  }
 });
