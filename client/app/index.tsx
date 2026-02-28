@@ -11,6 +11,8 @@ import {
 import { BleManager, Device, State } from "react-native-ble-plx";
 import { Buffer } from "buffer";
 import { PermissionsAndroid } from "react-native";
+import { WristFatigueDetector } from "../services/detector";
+import { requestPerms } from "../permissions";
 
 const SERVICE_UUID = "0000ffe5-0000-1000-8000-00805f9a34fb";
 const READ_UUID = "0000ffe4-0000-1000-8000-00805f9a34fb";
@@ -19,139 +21,7 @@ const WRITE_UUID = "0000ffe9-0000-1000-8000-00805f9a34fb";
 const bleManager = new BleManager();
 const int16 = (n: number) => (n >= 0x8000 ? n - 0x10000 : n);
 
-/* ================= FIR ================= */
-class FIRBandpass {
-  fastAlpha = 0.2;
-  slowAlpha = 0.02;
-  fast = 0;
-  slow = 0;
 
-  filter(x: number) {
-    this.fast += this.fastAlpha * (x - this.fast);
-    this.slow += this.slowAlpha * (x - this.slow);
-    return this.fast - this.slow;
-  }
-
-  reset() {
-    this.fast = 0;
-    this.slow = 0;
-  }
-}
-
-/* ================= FATIGUE ================= */
-class WristFatigueDetector {
-  win = 200;
-  alpha = 0.02;
-  beta = 0.02;
-  k = 0.3;
-  thresholdFactor = 7;
-  deadband = 0.5;
-
-  biasX = 0;
-  biasY = 0;
-  biasZ = 0;
-  calibrating = true;
-  calibrationSamples = 0;
-  calibrationLimit = 600;
-
-  buffer: number[] = [];
-  meanEst = 0;
-  varEst = 1;
-  cusumPos = 0;
-  detected = false;
-
-  filter = new FIRBandpass();
-
-  applyDeadband(v: number) {
-    return Math.abs(v) < this.deadband ? 0 : v;
-  }
-
-  magnitude(gx: number, gy: number, gz: number) {
-    return Math.sqrt(gx * gx + gy * gy + gz * gz);
-  }
-
-  rms(arr: number[]) {
-    const sum = arr.reduce((a, b) => a + b * b, 0);
-    return Math.sqrt(sum / arr.length);
-  }
-
-  update(gx: number, gy: number, gz: number) {
-    if (this.calibrating) {
-      this.biasX += gx;
-      this.biasY += gy;
-      this.biasZ += gz;
-      this.calibrationSamples++;
-
-      if (this.calibrationSamples >= this.calibrationLimit) {
-        this.biasX /= this.calibrationLimit;
-        this.biasY /= this.calibrationLimit;
-        this.biasZ /= this.calibrationLimit;
-        this.calibrating = false;
-      }
-      return { calibrating: true };
-    }
-
-    gx -= this.biasX;
-    gy -= this.biasY;
-    gz -= this.biasZ;
-
-    gx = this.applyDeadband(gx);
-    gy = this.applyDeadband(gy);
-    gz = this.applyDeadband(gz);
-
-    const mag = this.magnitude(gx, gy, gz);
-    const tremor = this.filter.filter(mag);
-
-    this.buffer.push(tremor);
-    if (this.buffer.length < this.win) return null;
-
-    const segment = this.buffer.splice(0, this.win);
-    const currentRMS = this.rms(segment);
-
-    this.meanEst =
-      (1 - this.alpha) * this.meanEst + this.alpha * currentRMS;
-
-    this.varEst =
-      (1 - this.beta) * this.varEst +
-      this.beta * Math.pow(currentRMS - this.meanEst, 2);
-
-    const stdEst = Math.sqrt(this.varEst);
-    if (stdEst < 1e-6) return null;
-
-    const z = (currentRMS - this.meanEst) / stdEst;
-    const s = z - this.k;
-
-    this.cusumPos = Math.max(0, this.cusumPos + s);
-
-    const fatiguePercent = Math.min(
-      100,
-      (this.cusumPos / this.thresholdFactor) * 100
-    );
-
-    if (this.cusumPos > this.thresholdFactor)
-      this.detected = true;
-
-    return {
-      rms: currentRMS,
-      fatiguePercent,
-      detected: this.detected,
-      st: this.cusumPos,
-      zt: z,
-      calibrating: false,
-    };
-  }
-}
-
-/* ================= PERMISSIONS ================= */
-async function requestPerms() {
-  if (Platform.OS !== "android") return true;
-  const granted = await PermissionsAndroid.requestMultiple([
-    PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
-    PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
-    PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-  ]);
-  return granted["android.permission.BLUETOOTH_SCAN"] === "granted";
-}
 
 /* ================= COMPONENT ================= */
 export default function Index() {
